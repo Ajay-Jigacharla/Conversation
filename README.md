@@ -163,14 +163,3 @@ voice-arch/
 | KittenTTS download slow | First run downloads ~25 MB model; subsequent calls are instant |
 | `activate.ps1 cannot be loaded` | Run: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 
-
-
-
-# Terminal 1 — Backend
-cd backend
-.venv\Scripts\Activate.ps1
-uvicorn main:app --reload --port 8000
-
-# Terminal 2 — Frontend
-cd frontend
-npm run dev
