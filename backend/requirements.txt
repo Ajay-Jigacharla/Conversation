@@ -1,0 +1,9 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+faster-whisper>=1.0.0
+kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl
+soundfile>=0.12.1
+httpx>=0.27.0
+python-dotenv>=1.0.0
+websockets>=12.0
