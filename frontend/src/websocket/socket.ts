@@ -13,6 +13,7 @@ export type SocketCallbacks = {
   onLLMResponse: (text: string) => void;
   onAudioResult: (buffer: ArrayBuffer) => void;
   onAudioDone?: () => void;
+  onNoSpeech?: () => void;
   onError: (msg: string) => void;
 };
 
@@ -24,6 +25,7 @@ export class StreamingClient {
   private ws: WebSocket | null = null;
   private callbacks: SocketCallbacks;
   private history: Turn[];
+  private aborted = false;
 
   constructor(opts: StreamingClientOptions) {
     this.callbacks = opts;
@@ -42,14 +44,17 @@ export class StreamingClient {
         }
         resolve();
       };
-      
+
       this.ws.onerror = (e) => {
+        if (this.aborted) return;
         console.error("WebSocket error:", e);
         this.callbacks.onError("WebSocket connection failed.");
         reject(e);
       };
 
       this.ws.onmessage = (event) => {
+        if (this.aborted) return;
+
         if (typeof event.data === "string") {
           try {
             const data = JSON.parse(event.data);
@@ -61,6 +66,8 @@ export class StreamingClient {
               this.callbacks.onLLMResponse(data.text);
             } else if (data.type === "audio_done") {
               this.callbacks.onAudioDone?.();
+            } else if (data.type === "no_speech") {
+              this.callbacks.onNoSpeech?.();
             } else if (data.type === "error") {
               this.callbacks.onError(data.message);
             }
@@ -68,7 +75,7 @@ export class StreamingClient {
             console.error("Error parsing WS message:", e);
           }
         } else if (event.data instanceof ArrayBuffer) {
-          // Binary data means the final TTS WAV file has arrived
+          // Binary data means a TTS WAV chunk has arrived.
           this.callbacks.onAudioResult(event.data);
         }
       };
@@ -101,6 +108,9 @@ export class StreamingClient {
 
   interrupt() {
     // Immediate cancellation. Send interrupt to kill backend tasks, then disconnect.
+    // After this, the old client's callbacks will be ignored so they cannot
+    // override the new barge-in state.
+    this.aborted = true;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "interrupt" }));
       this.ws.close();

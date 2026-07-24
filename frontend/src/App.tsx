@@ -5,33 +5,25 @@ import { StreamingClient } from "./websocket/socket";
 import { checkHealth, type Turn } from "./services/api";
 import { AudioPlaybackQueue } from "./audio/playback";
 
-/** UI turn shape shown in the conversation history panel. */
-interface HistoryItem {
-  transcript: string;
-  response: string;
-  timestamp: string;
-}
-
-/** Convert completed UI history to the backend's {role, content} turn format. */
-function toBackendTurns(history: HistoryItem[]): Turn[] {
+/** Convert UI history (newest-first) to backend chronological order.
+ *  Excludes the in-flight user turn that hasn't been answered yet. */
+function toBackendTurns(history: Turn[], inFlightContent?: string): Turn[] {
   const turns: Turn[] = [];
-  // history is stored newest-first; backend expects chronological order.
   for (let i = history.length - 1; i >= 0; i--) {
-    const h = history[i];
-    turns.push({ role: "user", content: h.transcript });
-    if (h.response) {
-      turns.push({ role: "assistant", content: h.response });
-    }
+    turns.push(history[i]);
+  }
+  if (inFlightContent) {
+    turns.push({ role: "user", content: inFlightContent });
   }
   return turns;
 }
 
 export default function App() {
-  const [orbState, setOrbState] = useState<OrbState>("idle");
-  const [status, setStatus] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
-  const [backendOk, setBackendOk] = useState<boolean | null>(null);
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [orbState, setOrbState]     = useState<OrbState>("idle");
+  const [status, setStatus]         = useState<string>("");
+  const [error, setError]           = useState<string | null>(null);
+  const [backendOk, setBackendOk]   = useState<boolean | null>(null);
+  const [history, setHistory]       = useState<Turn[]>([]);
 
   // Streaming state
   const [liveTranscript, setLiveTranscript] = useState<string>("");
@@ -40,33 +32,58 @@ export default function App() {
   const [autoStop, setAutoStop] = useState<boolean>(true);
   const [sensitivity, setSensitivity] = useState<SensitivityLevel>("medium");
 
-  const recorderRef = useRef<AudioStreamRecorder | null>(null);
-  const wsClientRef = useRef<StreamingClient | null>(null);
-  const playbackQueueRef = useRef<AudioPlaybackQueue | null>(null);
-  const currentResponseRef = useRef<string>("");
-  // Current turn being built in-flight (transcript + response).
-  const pendingTurnRef = useRef<HistoryItem | null>(null);
-  // Ref copy of completed history to pass into new connections without the in-flight turn.
-  const historyRef = useRef<HistoryItem[]>([]);
+  const recorderRef       = useRef<AudioStreamRecorder | null>(null);
+  const wsClientRef       = useRef<StreamingClient | null>(null);
+  const playbackQueueRef  = useRef<AudioPlaybackQueue | null>(null);
+
+  // Current user turn being transcribed.
+  const inFlightUserRef = useRef<Turn | null>(null);
+  // Accumulated assistant response for the current turn.
+  const partialResponseRef = useRef<string>("");
+
+  // Ref copy of completed history to pass into new connections.
+  const historyRef = useRef<Turn[]>([]);
   useEffect(() => { historyRef.current = history; }, [history]);
 
-  // Refs mirroring state so the VAD callback (created once) reads fresh values.
+  // Refs mirroring state so callbacks created once read fresh values.
   const autoStopRef = useRef<boolean>(autoStop);
   useEffect(() => { autoStopRef.current = autoStop; }, [autoStop]);
   const sensitivityRef = useRef<SensitivityLevel>(sensitivity);
   useEffect(() => { sensitivityRef.current = sensitivity; }, [sensitivity]);
-
   const orbStateRef = useRef<OrbState>(orbState);
   useEffect(() => { orbStateRef.current = orbState; }, [orbState]);
-  // True while the AI is speaking; used to ignore echo-induced VAD speech.
+
+  const setOrbStateSync = useCallback((state: OrbState) => {
+    orbStateRef.current = state;
+    setOrbState(state);
+  }, []);
+
+  // True while the AI is speaking.
   const isSpeakingRef = useRef<boolean>(false);
-  // Guard so a queued VAD fire doesn't trigger stop after the user already stopped.
+
+  // ── stopGuardRef ────────────────────────────────────────────────────────────
+  // True when silence auto-stop must be suppressed.
+  // Set to TRUE by: onSilenceDetected (after it fires, to prevent double-fire),
+  //                 and manual orb click during recording.
+  // Set to FALSE by: fresh turn start (handleOrbClick line ~295),
+  //                  and after WS reconnect + resetVAD completes (auto-listen path).
+  // NEVER touched inside startNewTurn — that way Turn 1 keeps stopGuard=false
+  // as set by handleOrbClick, and Turn 2+ restores it via the .then() callback.
   const stopGuardRef = useRef<boolean>(false);
-  // Buffer of recent audio frames captured while not actively streaming (e.g. during playback).
-  // Flushed into a new WebSocket when barge-in starts, so the start of speech isn't lost.
-  const preRollRef = useRef<Int16Array[]>([]);
-  // True while we're waiting for a new WebSocket connection after barge-in.
+
+  // True while a new WebSocket is being established.
   const reconnectingRef = useRef<boolean>(false);
+  // Queues silence stop if silence was detected while WS was connecting.
+  const pendingSilenceStopRef = useRef<boolean>(false);
+
+  // Prevents concurrent auto barge-ins from firing multiple reconnects.
+  const bargeInInProgressRef = useRef<boolean>(false);
+
+  // Buffer of recent audio frames captured while not actively streaming.
+  const preRollRef = useRef<Int16Array[]>([]);
+
+  // Reference to the currently active StreamingClient; stale clients are ignored.
+  const activeClientRef = useRef<StreamingClient | null>(null);
 
   // Health check on mount
   useEffect(() => {
@@ -76,150 +93,252 @@ export default function App() {
     });
   }, []);
 
-  // ── Stop the current turn: stop mic + tell backend to finalize ───────
-  // Triggered by the manual "stop" click.
+  // ── Commit the current assistant response as an interrupted turn ───────
+  const commitInterruptedTurn = useCallback(() => {
+    const userTurn = inFlightUserRef.current;
+    const partialResponse = partialResponseRef.current.trim();
+
+    setHistory((h) => {
+      const turns: Turn[] = [];
+      if (userTurn) turns.push(userTurn);
+      if (partialResponse) {
+        turns.push({ role: "assistant", content: partialResponse, interrupted: true });
+      }
+      return [...turns, ...h];
+    });
+
+    inFlightUserRef.current = null;
+    partialResponseRef.current = "";
+  }, []);
+
+  // ── Stop the current turn: tell backend to finalize ───────────────────
   const stopRecording = useCallback(() => {
-    setOrbState("processing");
+    setOrbStateSync("processing");
     setStatus("Finalizing pipeline (LLM → TTS)…");
 
     if (recorderRef.current) {
       recorderRef.current.resetVAD();
     }
     if (wsClientRef.current) {
-      wsClientRef.current.stop(); // Closes the WS, triggering backend finalizing
+      wsClientRef.current.stop();
     }
-  }, []);
+  }, [setOrbStateSync]);
 
+  // ── Stable ref to startNewTurn so closures (playbackQueue.onDone, onBargeIn)
+  //    always call the latest version without stale captures. ────────────────
+  const createClientAndConnectRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
+  // ── startNewTurn ──────────────────────────────────────────────────────────
+  const startNewTurn = useCallback(async () => {
+    playbackQueueRef.current?.stop();
+    isSpeakingRef.current = false;
+    pendingSilenceStopRef.current = false;
+    reconnectingRef.current = true;   // ← blocks onSilenceDetected during WS connect
+
+    playbackQueueRef.current = new AudioPlaybackQueue(() => {
+      // ── onDone: AI finished speaking → auto-listen for next turn ──────
+      isSpeakingRef.current = false;
+
+      // Clean VAD and arm silence guard synchronously right as listening begins
+      recorderRef.current?.setBargeInMode(false);
+      recorderRef.current?.resetVAD();
+      stopGuardRef.current = false;
+      preRollRef.current = [];
+
+      // Commit completed turn to history.
+      const userTurn = inFlightUserRef.current;
+      const response = partialResponseRef.current.trim();
+      if (userTurn || response) {
+        setHistory((h) => {
+          const turns: Turn[] = [];
+          if (userTurn) turns.push(userTurn);
+          if (response) turns.push({ role: "assistant", content: response });
+          return [...turns, ...h];
+        });
+      }
+      inFlightUserRef.current = null;
+      partialResponseRef.current = "";
+
+      // Switch orb to listening mode immediately so the user sees feedback.
+      setLiveTranscript("");
+      setOrbStateSync("recording");
+      setStatus("Listening…");
+
+      // Open a fresh WebSocket for Turn N+1 in background.
+      createClientAndConnectRef.current()
+        .catch((e) => {
+          console.error("Failed to auto-connect for next turn:", e);
+          stopGuardRef.current = false;
+          setOrbStateSync("idle");
+          setStatus("Tap to speak.");
+        });
+    });
+
+    const priorHistory = toBackendTurns(historyRef.current, inFlightUserRef.current?.content);
+
+    const client = new StreamingClient({
+      history: priorHistory,
+      onPartial: (text) => setLiveTranscript(text),
+      onFinal: (text) => {
+        setLiveTranscript(text);
+        partialResponseRef.current = "";
+        inFlightUserRef.current = {
+          role: "user",
+          content: text,
+          timestamp: new Date().toLocaleTimeString(),
+        };
+      },
+      onLLMResponse: (text) => {
+        setStatus("Generating voice response…");
+        partialResponseRef.current += text + " ";
+
+        const response = partialResponseRef.current.trim();
+        const userTurn = inFlightUserRef.current;
+        if (userTurn && response) {
+          setHistory((h) => {
+            const draftAssistant: Turn = { role: "assistant", content: response };
+            const isSameUserAtTop =
+              h.length >= 2 &&
+              h[0].role === "assistant" &&
+              h[1].role === "user" &&
+              h[1].content === userTurn.content &&
+              h[1].timestamp === userTurn.timestamp;
+
+            if (isSameUserAtTop) {
+              const newH = [...h];
+              newH[0] = draftAssistant;
+              return newH;
+            }
+            return [draftAssistant, userTurn, ...h];
+          });
+        }
+      },
+      onAudioResult: async (buffer) => {
+        isSpeakingRef.current = true;
+        recorderRef.current?.setBargeInMode(true);
+        setOrbStateSync("playing");
+        setStatus("Playing response…");
+        await playbackQueueRef.current?.enqueue(buffer);
+      },
+      onAudioDone: () => {
+        isSpeakingRef.current = false;
+        recorderRef.current?.setBargeInMode(false);
+        playbackQueueRef.current?.finish();
+      },
+      onNoSpeech: () => {
+        console.log("[App] Backend reported no speech detected.");
+        inFlightUserRef.current = null;
+        partialResponseRef.current = "";
+        setLiveTranscript("");
+        recorderRef.current?.resetVAD();
+        stopGuardRef.current = false;
+        setOrbStateSync("recording");
+        setStatus("Listening…");
+
+        createClientAndConnectRef.current()
+          .catch((e) => {
+            console.error("Failed to auto-connect after no_speech:", e);
+            stopGuardRef.current = false;
+            setOrbStateSync("idle");
+            setStatus("Tap to start continuous conversation.");
+          });
+      },
+      onError: (msg) => {
+        setError(`Streaming error: ${msg}`);
+        setOrbStateSync("idle");
+        setStatus("Something went wrong.");
+        isSpeakingRef.current = false;
+        reconnectingRef.current = false;
+        stopGuardRef.current = false;
+        playbackQueueRef.current?.stop();
+        recorderRef.current?.stop();
+      }
+    });
+
+    wsClientRef.current = client;
+    activeClientRef.current = client;
+    await client.connect();
+
+    // WS open — flush pre-roll frames buffered during reconnect.
+    reconnectingRef.current = false;
+    const buffered = preRollRef.current;
+    preRollRef.current = [];
+    for (const frame of buffered) {
+      if (activeClientRef.current === client && client.isOpen()) {
+        client.sendAudioChunk(frame);
+      }
+    }
+
+    // If silence occurred while WS was connecting, execute stop immediately now.
+    if (pendingSilenceStopRef.current && orbStateRef.current === "recording") {
+      console.log("[App] Executing queued silence stop after WS connected.");
+      pendingSilenceStopRef.current = false;
+      stopGuardRef.current = true;
+      setStatus("Silence detected — finalizing…");
+      stopRecording();
+    }
+  }, [setOrbStateSync, stopRecording]);
+
+  useEffect(() => {
+    createClientAndConnectRef.current = startNewTurn;
+  }, [startNewTurn]);
+
+  // ── handleOrbClick ────────────────────────────────────────────────────────
   const handleOrbClick = useCallback(async () => {
     setError(null);
 
+    // ── Recording → manually stop ──────────────────────────────────────
     if (orbState === "recording") {
       stopGuardRef.current = true;
       stopRecording();
       return;
     }
 
-    // Either idle (new turn) or playing (manual barge-in).
-    const isBargeIn = orbState === "playing";
+    const isBargeIn = orbState === "playing" || orbState === "processing";
 
-    const createClientAndConnect = async () => {
-      playbackQueueRef.current?.stop();
-      isSpeakingRef.current = false;
-      reconnectingRef.current = true;
-      playbackQueueRef.current = new AudioPlaybackQueue(() => {
-        isSpeakingRef.current = false;
-        const completed = pendingTurnRef.current;
-        if (completed) {
-          completed.response = currentResponseRef.current;
-          setHistory((h) => {
-            const idx = h.findIndex((t) => t === completed);
-            if (idx >= 0) {
-              const newH = [...h];
-              newH[idx] = completed;
-              return newH;
-            }
-            return [completed, ...h];
-          });
-          pendingTurnRef.current = null;
-        }
-        setOrbState("idle");
-        setStatus("Done. Tap to speak again.");
-        setLiveTranscript("");
-      });
-
-      const priorHistory = toBackendTurns(historyRef.current);
-      const client = new StreamingClient({
-        history: priorHistory,
-        onPartial: (text) => setLiveTranscript(text),
-        onFinal: (text) => {
-          setLiveTranscript(text);
-          currentResponseRef.current = "";
-          pendingTurnRef.current = {
-            transcript: text,
-            response: "",
-            timestamp: new Date().toLocaleTimeString(),
-          };
-        },
-        onLLMResponse: (text) => {
-          setStatus("Generating voice response…");
-          currentResponseRef.current += text + " ";
-          const draft = pendingTurnRef.current;
-          if (draft) {
-            draft.response = currentResponseRef.current;
-            setHistory((h) => {
-              if (h.length > 0 && h[0] === draft) return h;
-              return [draft, ...h];
-            });
-          }
-        },
-        onAudioResult: async (buffer) => {
-          isSpeakingRef.current = true;
-          setOrbState("playing");
-          setStatus("Playing response…");
-          await playbackQueueRef.current?.enqueue(buffer);
-        },
-        onAudioDone: () => {
-          playbackQueueRef.current?.finish();
-        },
-        onError: (msg) => {
-          setError(`Streaming error: ${msg}`);
-          setOrbState("idle");
-          setStatus("Something went wrong.");
-          isSpeakingRef.current = false;
-          reconnectingRef.current = false;
-          playbackQueueRef.current?.stop();
-          recorderRef.current?.stop();
-        }
-      });
-      wsClientRef.current = client;
-      await client.connect();
-
-      // Connection is ready: flush any buffered pre-roll frames, then resume normal streaming.
-      reconnectingRef.current = false;
-      const buffered = preRollRef.current;
-      preRollRef.current = [];
-      for (const frame of buffered) {
-        if (client.isOpen()) client.sendAudioChunk(frame);
-      }
-    };
-
+    // ── Playing / Processing → barge-in ───────────────────────────────
     if (isBargeIn) {
-      // Manual barge-in: kill the active response and open a fresh connection.
+      if (bargeInInProgressRef.current) return;
+      bargeInInProgressRef.current = true;
       stopGuardRef.current = false;
+      isSpeakingRef.current = false;
+      recorderRef.current?.setBargeInMode(false);
+      recorderRef.current?.resetVAD();
       playbackQueueRef.current?.stop();
       wsClientRef.current?.interrupt();
+      commitInterruptedTurn();
       setLiveTranscript("");
-      setOrbState("recording");
+      setOrbStateSync("recording");
       setStatus("Interrupted. Listening…");
 
       try {
-        await createClientAndConnect();
-        recorderRef.current?.resetVAD();
+        await createClientAndConnectRef.current();
       } catch (e: any) {
         setError(e.message || "Barge-in connection failed.");
-        setOrbState("idle");
+        setOrbStateSync("idle");
         reconnectingRef.current = false;
+        stopGuardRef.current = false;
+      } finally {
+        bargeInInProgressRef.current = false;
       }
       return;
     }
 
     if (orbState !== "idle") return;
 
-    // Start recording and streaming
+    // ── Idle → start fresh Turn 1 ──────────────────────────────────────
     stopGuardRef.current = false;
     setLiveTranscript("");
-    setOrbState("recording");
+    setOrbStateSync("recording");
     setStatus("Listening…");
 
     try {
-      await createClientAndConnect();
+      await createClientAndConnectRef.current();
 
       const recorder = new AudioStreamRecorder({
         onChunk: (chunk) => {
-          // While reconnecting after barge-in, buffer chunks so we don't lose the start of speech.
           if (reconnectingRef.current) {
             preRollRef.current.push(chunk);
-            // Keep only the last ~1.5 s of pre-roll (30 ms frames = ~33 fps).
             if (preRollRef.current.length > 50) preRollRef.current.shift();
             return;
           }
@@ -227,43 +346,66 @@ export default function App() {
           if (orbStateRef.current === "recording" && wsClientRef.current?.isOpen()) {
             wsClientRef.current.sendAudioChunk(chunk);
           } else {
-            // Not actively streaming: keep a short rolling buffer for barge-in.
             preRollRef.current.push(chunk);
             if (preRollRef.current.length > 50) preRollRef.current.shift();
           }
         },
+
         onSpeechDetected: () => {
-          // Ignore the AI's own voice while it is speaking through the speakers.
-          if (isSpeakingRef.current) return;
+          // VAD transitioned idle → speaking during normal recording.
+        },
+
+        onBargeIn: () => {
+          if (reconnectingRef.current) return;
+          if (bargeInInProgressRef.current) return;
 
           const state = orbStateRef.current;
           if (state === "playing" || state === "processing") {
-            console.log("Barge-in detected!");
-            playbackQueueRef.current?.stop();
-            wsClientRef.current?.interrupt();
-            setLiveTranscript("");
-            setOrbState("recording");
-            setStatus("Interrupted. Listening…");
+            console.log("[App] Barge-in detected!");
+            bargeInInProgressRef.current = true;
             stopGuardRef.current = false;
+            isSpeakingRef.current = false;
+            playbackQueueRef.current?.stop();
+            recorderRef.current?.setBargeInMode(false);
+            recorderRef.current?.resetVAD();
+            wsClientRef.current?.interrupt();
+            commitInterruptedTurn();
+            setLiveTranscript("");
+            setOrbStateSync("recording");
+            setStatus("Interrupted. Listening…");
 
-            createClientAndConnect()
-              .then(() => {
-                // Fresh VAD state for the new question.
-                recorderRef.current?.resetVAD();
-              })
+            createClientAndConnectRef.current()
               .catch((e) => {
                 setError("Barge-in reconnect failed: " + e.message);
-                setOrbState("idle");
+                setOrbStateSync("idle");
+                stopGuardRef.current = false;
                 reconnectingRef.current = false;
+              })
+              .finally(() => {
+                bargeInInProgressRef.current = false;
               });
           }
         },
+
         onSilenceDetected: () => {
-          if (!autoStopRef.current || stopGuardRef.current || orbStateRef.current !== "recording") return;
-          stopGuardRef.current = true;
+          if (
+            !autoStopRef.current ||
+            stopGuardRef.current ||
+            orbStateRef.current !== "recording"
+          ) return;
+
+          stopGuardRef.current = true;   // prevent double-fire
+
+          if (reconnectingRef.current) {
+            console.log("[App] Silence detected during WS connect — queuing stop.");
+            pendingSilenceStopRef.current = true;
+            setStatus("Silence detected — finalizing…");
+            return;
+          }
+
           setStatus("Silence detected — finalizing…");
           stopRecording();
-        }
+        },
       });
 
       recorder.setSensitivity(sensitivityRef.current);
@@ -271,9 +413,9 @@ export default function App() {
       await recorder.start();
     } catch (e: any) {
       setError(e.message || "Failed to start recorder/websocket.");
-      setOrbState("idle");
+      setOrbStateSync("idle");
     }
-  }, [orbState, liveTranscript, stopRecording]);
+  }, [orbState, stopRecording, commitInterruptedTurn, setOrbStateSync]);
 
   return (
     <div className="app">
@@ -351,15 +493,13 @@ export default function App() {
           <h2 className="history-title">Conversation</h2>
           <div className="history-list">
             {history.map((turn, i) => (
-              <div key={i} className="turn-card glass-card">
-                <div className="turn-time">{turn.timestamp}</div>
-                <div className="turn-row turn-user">
-                  <span className="turn-badge badge-user">You</span>
-                  <p className="turn-text">{turn.transcript}</p>
-                </div>
-                <div className="turn-row turn-ai">
-                  <span className="turn-badge badge-ai">AI</span>
-                  <p className="turn-text">{turn.response}</p>
+              <div key={i} className={`turn-card glass-card ${turn.interrupted ? "turn-card--interrupted" : ""}`}>
+                <div className="turn-time">{turn.timestamp ?? ""}</div>
+                <div className={`turn-row ${turn.role === "user" ? "turn-user" : "turn-ai"}`}>
+                  <span className={`turn-badge ${turn.role === "user" ? "badge-user" : "badge-ai"}`}>
+                    {turn.role === "user" ? "You" : turn.interrupted ? "AI (interrupted)" : "AI"}
+                  </span>
+                  <p className="turn-text">{turn.content}</p>
                 </div>
               </div>
             ))}

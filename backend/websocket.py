@@ -21,15 +21,26 @@ QUEUE_DONE = None
 
 
 def _parse_history(payload: dict) -> list[dict[str, str]]:
-    """Validate an incoming history payload into clean {role, content} turns."""
+    """Validate an incoming history payload into clean {role, content} turns.
+
+    Preserves optional metadata like 'interrupted' in a stable key so the LLM
+    prompt builder can hint that an assistant turn was cut off by the user.
+    """
     raw = payload.get("history")
     if not isinstance(raw, list):
         return []
-    return [
-        {"role": str(t["role"]), "content": str(t["content"])}
-        for t in raw
-        if isinstance(t, dict) and "role" in t and "content" in t
-    ]
+    parsed: list[dict[str, str]] = []
+    for t in raw:
+        if not isinstance(t, dict) or "role" not in t or "content" not in t:
+            continue
+        turn = {
+            "role": str(t["role"]),
+            "content": str(t["content"]),
+        }
+        if t.get("interrupted"):
+            turn["interrupted"] = "true"
+        parsed.append(turn)
+    return parsed
 
 
 @router.websocket("/ws/stream")
@@ -87,7 +98,7 @@ async def websocket_stream(websocket: WebSocket):
                     continue
 
                 if data.get("type") == "stop" or "stop" in message["text"]:
-                    logger.info("Client requested stop. Breaking receive loop.")
+                    logger.info("Received stop signal from frontend.")
                     break
 
                 if data.get("type") == "interrupt":
@@ -106,25 +117,28 @@ async def websocket_stream(websocket: WebSocket):
     except Exception as e:
         logger.error("WebSocket error: %s", e)
     finally:
+        was_active = streaming_active
         streaming_active = False
         processor_task.cancel()
 
-        # Run final pipeline
-        try:
-            logger.info("Running final pipeline...")
-            final_text = transcriber.transcribe_final()
-
-            if not final_text:
-                logger.info("No speech detected in stream.")
-            else:
-                await websocket.send_json({"type": "final_transcript", "text": final_text})
-                await _stream_response(websocket, final_text, history)
-        except Exception as e:
-            logger.error("Error during finalization: %s", e)
+        # Run final pipeline only if stream was active and not interrupted
+        if was_active:
             try:
-                await websocket.send_json({"type": "error", "message": str(e)})
-            except:
-                pass
+                logger.info("Running final pipeline...")
+                final_text = transcriber.transcribe_final()
+
+                if not final_text:
+                    logger.info("No speech detected in stream.")
+                    await websocket.send_json({"type": "no_speech"})
+                else:
+                    await websocket.send_json({"type": "final_transcript", "text": final_text})
+                    await _stream_response(websocket, final_text, history)
+            except Exception as e:
+                logger.error("Error during finalization: %s", e)
+                try:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                except:
+                    pass
 
         # Finally, close the websocket (if it's not already closed by the client)
         try:

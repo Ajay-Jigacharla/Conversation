@@ -15,6 +15,8 @@ export interface Turn {
   role: ChatRole;
   content: string;
   timestamp?: string;
+  /** True if this assistant turn was cut off by the user interrupting it. */
+  interrupted?: boolean;
 }
 
 export interface ChatResult {
@@ -45,8 +47,8 @@ export async function sendAudio(audioBlob: Blob, history: Turn[] = []): Promise<
   }
 
   const audioBuffer = await res.arrayBuffer();
-  const transcript  = decodeURIComponent(res.headers.get("X-Transcript") ?? "");
-  const response    = decodeURIComponent(res.headers.get("X-Response")   ?? "");
+  const transcript = decodeURIComponent(res.headers.get("X-Transcript") ?? "");
+  const response = decodeURIComponent(res.headers.get("X-Response") ?? "");
 
   return { audioBuffer, transcript, response };
 }

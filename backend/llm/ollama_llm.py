@@ -30,7 +30,10 @@ SYSTEM_PROMPT = (
     "Keep your responses concise, natural, and conversational — "
     "as if you are speaking out loud to a person. "
     "Avoid markdown, bullet points, headers, or code blocks unless the user "
-    "explicitly asks for code. Aim for 1 to 3 sentences for most answers."
+    "explicitly asks for code. Aim for 1 to 3 sentences for most answers. "
+    "If a previous assistant message was marked as interrupted, treat it as "
+    "a partial response that the user cut off. Use it as context, but answer "
+    "the user's latest request rather than continuing the cut-off response."
 )
 
 
@@ -44,11 +47,16 @@ def _build_messages(transcript: str, history: list[dict[str, str]] | None = None
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         # Keep only valid turns and trim to the last N to protect context window.
-        valid = [
-            {"role": t["role"], "content": t["content"]}
-            for t in history[-_MAX_HISTORY_TURNS:]
-            if t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str)
-        ]
+        # Preserve a small hint for interrupted assistant turns so the model knows
+        # the response was cut off by the user.
+        valid: list[dict[str, str]] = []
+        for t in history[-_MAX_HISTORY_TURNS:]:
+            if t.get("role") not in ("user", "assistant") or not isinstance(t.get("content"), str):
+                continue
+            content = t["content"]
+            if t.get("role") == "assistant" and t.get("interrupted"):
+                content = f"[Interrupted] {content}"
+            valid.append({"role": str(t["role"]), "content": content})
         messages.extend(valid)
     messages.append({"role": "user", "content": transcript})
     return messages
@@ -124,15 +132,20 @@ async def generate_response_stream(transcript: str, history: list[dict[str, str]
                     if chunk:
                         sentence_buffer += chunk
                         
-                        # Check for sentence boundaries followed by space/newline
-                        punctuations = ['. ', '! ', '? ', '.\\n', '!\\n', '?\\n']
-                        for p in punctuations:
-                            # Use regular newline if escaped newline is not found
-                            real_p = p.replace('\\n', '\n')
-                            if real_p in sentence_buffer:
-                                parts = sentence_buffer.split(real_p, 1)
-                                yield (parts[0] + real_p.strip()).strip()
-                                sentence_buffer = parts[1] if len(parts) > 1 else ""
+                        # Extract as many sentences as possible from the current buffer
+                        while True:
+                            found_boundary = False
+                            punctuations = ['. ', '! ', '? ', '.\\n', '!\\n', '?\\n']
+                            for p in punctuations:
+                                real_p = p.replace('\\n', '\n')
+                                if real_p in sentence_buffer:
+                                    parts = sentence_buffer.split(real_p, 1)
+                                    yield (parts[0] + real_p.strip()).strip()
+                                    sentence_buffer = parts[1] if len(parts) > 1 else ""
+                                    found_boundary = True
+                                    break
+                            
+                            if not found_boundary:
                                 break
                 except json.JSONDecodeError:
                     pass
